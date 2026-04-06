@@ -1,1 +1,705 @@
 
+---
+- hosts: local
+  become: true
+  vars:
+    common_packages:
+      - tmux
+      - vim
+      - htop
+      - rclone
+      - restic
+      - git
+      - rsync
+      - ansible
+      - opentofu
+      - net-tools
+      - mc
+      - nano
+      - sshfs
+    # Optional secure variables; set via extra-vars or environment
+    restic_repository: ''
+    restic_password: ''
+    # Optional: path to a file on the Ansible controller that contains RESTIC env
+    # This supports Ansible Vault: provide a vaulted file path and run ansible-playbook with --ask-vault-pass
+    restic_vault_path: ''
+    # Optional: plain file on controller to copy to /etc/restic/env
+    restic_env_file: ''
+    # Install ReaR (Relax-and-Recover) - set true to enable
+    install_rear: false
+    # Optional: explicit OpenTofu URL (bootstrap.sh may pass this). If empty, playbook will try GitHub API and select asset matching host arch.
+    opentofu_url: ''
+    # rclone remote to use for syncing restic repository and ReaR outputs
+    rclone_remote: 'myremote:backups'
+    # rclone automatic config creation
+    rclone_config_auto: false
+    rclone_remote_name: 'myremote'
+    rclone_provider: 's3'
+    rclone_access_key: ''
+    rclone_secret_key: ''
+    rclone_region: ''
+    rclone_endpoint: ''
+    # Initialize a local restic repo (used before rclone sync). If true, restic_repository or a default local path is used.
+    restic_init_repo: false
+  tasks:
+    - name: Ensure apt cache is updated
+      apt:
+        update_cache: yes
+
+    - name: Install common packages (use apt where available)
+      apt:
+        name: "{{ common_packages }}"
+        state: present
+      register: apt_result
+      ignore_errors: yes
+
+    - name: Ensure pip is present (some tools may come from pip)
+      apt:
+        name: python3-pip
+        state: present
+
+    - name: Install restic if missing via package or pip fallback
+      block:
+        - name: Check restic binary
+          stat:
+            path: /usr/bin/restic
+          register: restic_stat
+
+        - name: Install restic via apt if available
+          apt:
+            name: restic
+            state: present
+          when: not restic_stat.stat.exists
+
+        - name: Install restic via pip as fallback
+          pip:
+            name: restic
+            state: present
+          when: not restic_stat.stat.exists
+
+    # OpenTofu installation is handled after attempting to discover a matching asset
+
+    - name: If no explicit opentofu_url provided, try to fetch matching release asset from GitHub (multi-arch)
+      when: (opentofu_url is not defined) or (opentofu_url == '')
+      block:
+        - name: Determine host architecture mapping
+          set_fact:
+            arch_map:
+              x86_64: amd64
+              amd64: amd64
+              aarch64: arm64
+              arm64: arm64
+              arm: arm
+
+        - name: Resolve arch name for releases
+          set_fact:
+            release_arch: "{{ arch_map.get(ansible_architecture, ansible_architecture) }}"
+
+        - name: Query GitHub for latest OpenTofu release and choose an asset
+          uri:
+            url: https://api.github.com/repos/opentofu/opentofu/releases/latest
+            return_content: yes
+          register: github_release
+
+        - name: Parse selected asset URL and tag
+          set_fact:
+            fetched_opentofu_url: >-
+              {{ (github_release.content | from_json).assets | selectattr('name','search', ("linux")) | list | selectattr('name','search', release_arch) | map(attribute='browser_download_url') | list | first | default('') }}
+            fetched_opentofu_tag: >-
+              {{ (github_release.content | from_json).tag_name | default('') }}
+            fetched_opentofu_checksum_url: >-
+              {{ (github_release.content | from_json).assets | selectattr('name','search', '(sha256|checksums|sha256sum|SHA256)') | list | map(attribute='browser_download_url') | list | first | default('') }}
+
+        - name: Debug selected opentofu asset and tag
+          debug:
+            msg: "Selected OpenTofu URL: {{ fetched_opentofu_url }} tag={{ fetched_opentofu_tag }}"
+
+        - name: Set opentofu_url from fetched value
+          set_fact:
+            opentofu_url: "{{ fetched_opentofu_url }}"
+            opentofu_release_tag: "{{ fetched_opentofu_tag }}"
+            opentofu_checksum_url: "{{ fetched_opentofu_checksum_url | default('') }}"
+
+    - name: Install OpenTofu binary if opentofu_url was found (idempotent)
+      when: opentofu_url is defined and opentofu_url != ''
+      block:
+        - name: Create temp extraction dir
+          file:
+            path: /tmp/opentofu_extract
+            state: directory
+            mode: '0755'
+
+        - name: Download OpenTofu archive to tmp
+          get_url:
+            url: "{{ opentofu_url }}"
+            dest: "/tmp/opentofu.tar.gz"
+            mode: '0644'
+
+        - name: Extract OpenTofu archive
+          unarchive:
+            src: /tmp/opentofu.tar.gz
+            dest: /tmp/opentofu_extract
+            remote_src: yes
+
+        - name: Find extracted opentofu binary
+          find:
+            paths: /tmp/opentofu_extract
+            patterns: opentofu*
+            file_type: file
+          register: opentofu_find
+
+        - name: Fail if no opentofu binary found in archive
+          fail:
+            msg: "No opentofu binary found in downloaded archive"
+          when: opentofu_find.files | length == 0
+
+        - name: Set new_opentofu_path
+          set_fact:
+            new_opentofu_path: "{{ opentofu_find.files[0].path }}"
+
+        - name: Compute checksum of new binary
+          command: sha256sum "{{ new_opentofu_path }}"
+          register: newsum
+
+        - name: If checksum URL present, download and verify checksum file
+          when: opentofu_checksum_url is defined and opentofu_checksum_url != ''
+          block:
+            - name: Download checksum file
+              get_url:
+                url: "{{ opentofu_checksum_url }}"
+                dest: /tmp/opentofu.checksums
+                mode: '0644'
+
+            - name: Set basename for extracted opentofu path
+              set_fact:
+                new_opentofu_basename: "{{ new_opentofu_path | basename }}"
+
+            - name: Extract expected checksum for the binary from checksum file
+              shell: >-
+                awk '/{{ new_opentofu_basename | replace("/","\\/") }}/ {print $1; exit}' /tmp/opentofu.checksums
+              register: expected_checksum_cmd
+              changed_when: false
+
+            - name: Fail if no expected checksum could be extracted
+              fail:
+                msg: "Could not extract expected checksum for {{ new_opentofu_path }} from checksum file"
+              when: expected_checksum_cmd.stdout == ''
+
+            - name: Compare expected checksum to computed checksum
+              assert:
+                that:
+                  - expected_checksum_cmd.stdout == newsum.stdout.split()[0]
+                fail_msg: "Checksum mismatch: expected {{ expected_checksum_cmd.stdout }} but got {{ newsum.stdout.split()[0] }}"
+
+        - name: Compute checksum of installed binary if present
+          command: sha256sum /usr/local/bin/opentofu
+          register: oldsum
+          failed_when: false
+          changed_when: false
+
+        - name: Install new OpenTofu binary if checksum differs
+          copy:
+            src: "{{ new_opentofu_path }}"
+            dest: /usr/local/bin/opentofu
+            owner: root
+            group: root
+            mode: '0755'
+          when: oldsum.rc != 0 or (oldsum.stdout.split()[0] != newsum.stdout.split()[0])
+
+        - name: Cleanup extracted files
+          file:
+            path: /tmp/opentofu_extract
+            state: absent
+
+
+    - name: Create dotfiles for target user
+      vars:
+        dotfiles_dir: "/home/{{ target_user }}/.config/onboarding"
+      file:
+        path: "{{ dotfiles_dir }}"
+        state: directory
+        owner: "{{ target_user }}"
+        group: "{{ target_user }}"
+        mode: '0755'
+
+    - name: Deploy tmux.conf
+      copy:
+        dest: "/home/{{ target_user }}/.tmux.conf"
+        content: |
+          # Basic tmux settings
+          set -g mouse on
+          setw -g mode-keys vi
+          set -g history-limit 5000
+          # Better pane navigation with vim-like keys
+          bind -n C-h select-pane -L
+          bind -n C-l select-pane -R
+          bind -n C-j select-pane -D
+          bind -n C-k select-pane -U
+        owner: "{{ target_user }}"
+        group: "{{ target_user }}"
+        mode: '0644'
+
+    - name: Deploy bash aliases and sane defaults
+      copy:
+        dest: "/home/{{ target_user }}/.bash_aliases"
+        content: |
+          # Simple aliases
+          alias ll='ls -alF'
+          alias la='ls -A'
+          alias l='ls -CF'
+          alias gs='git status'
+          export EDITOR=vim
+        owner: "{{ target_user }}"
+        group: "{{ target_user }}"
+        mode: '0644'
+
+    - name: Ensure .bashrc sources .bash_aliases
+      lineinfile:
+        path: "/home/{{ target_user }}/.bashrc"
+        line: "if [ -f ~/.bash_aliases ]; then . ~/.bash_aliases; fi"
+        create: yes
+        owner: "{{ target_user }}"
+        group: "{{ target_user }}"
+        mode: '0644'
+
+    - name: Deploy vimrc
+      copy:
+        dest: "/home/{{ target_user }}/.vimrc"
+        content: |
+          " Basic vimrc
+          set nocompatible
+          set number
+          syntax on
+          set tabstop=4 shiftwidth=4 expandtab
+          set clipboard=unnamedplus
+          filetype plugin indent on
+          " Use vim-plug to manage plugins (will be bootstrapped)
+          call plug#begin('~/.vim/plugged')
+          Plug 'tpope/vim-sensible'
+          Plug 'junegunn/fzf', { 'do': { -> fzf#install() } }
+          call plug#end()
+        owner: "{{ target_user }}"
+        group: "{{ target_user }}"
+        mode: '0644'
+
+    - name: Ensure vim-plug for target user
+      become_user: "{{ target_user }}"
+      get_url:
+        url: https://raw.githubusercontent.com/junegunn/vim-plug/master/plug.vim
+        dest: "/home/{{ target_user }}/.vim/autoload/plug.vim"
+        mode: '0644'
+      args:
+        creates: "/home/{{ target_user }}/.vim/autoload/plug.vim"
+
+    - name: Configure git defaults
+      copy:
+        dest: "/home/{{ target_user }}/.gitconfig"
+        content: |
+          [user]
+            name = {{ target_user }}
+            email = {{ target_user }}@localhost
+        owner: "{{ target_user }}"
+        group: "{{ target_user }}"
+        mode: '0644'
+
+    - name: Ensure user is in fuse group for sshfs
+      user:
+        name: "{{ target_user }}"
+        groups: fuse
+        append: yes
+
+    - name: Deploy example rclone config (commented template)
+      copy:
+        dest: "/home/{{ target_user }}/.config/rclone/rclone.conf"
+        content: |
+          # Example rclone config. DO NOT put secrets here in repo.
+          # [myremote]
+          # type = s3
+          # provider = AWS
+          # env_auth = false
+          # access_key_id = <ACCESS_KEY>
+          # secret_access_key = <SECRET>
+          # region = us-east-1
+        owner: "{{ target_user }}"
+        group: "{{ target_user }}"
+        mode: '0600'
+
+    - name: Deploy example restic backup systemd service and timer
+      vars:
+        restic_service: /etc/systemd/system/restic-backup.service
+        restic_timer: /etc/systemd/system/restic-backup.timer
+      block:
+        - name: Deploy restic environment from Ansible Vault file (if provided)
+          copy:
+            dest: /etc/restic/env
+            content: "{{ lookup('file', restic_vault_path) }}"
+            owner: root
+            group: root
+            mode: '0600'
+          when: restic_vault_path is defined and restic_vault_path != ''
+
+        - name: Deploy restic environment from controller file (if provided)
+          copy:
+            src: "{{ restic_env_file }}"
+            dest: /etc/restic/env
+            owner: root
+            group: root
+            mode: '0600'
+          when: restic_env_file is defined and restic_env_file != ''
+
+        - name: Deploy restic environment from provided vars
+          copy:
+            dest: /etc/restic/env
+            content: |
+              RESTIC_REPOSITORY={{ restic_repository | default('') }}
+              RESTIC_PASSWORD={{ restic_password | default('') }}
+            owner: root
+            group: root
+            mode: '0600'
+          when: (restic_vault_path == '' and restic_env_file == '') and (restic_repository != '' or restic_password != '')
+
+    - name: Deploy restic service using EnvironmentFile when available
+      copy:
+        dest: "{{ restic_service }}"
+        content: |
+              [Unit]
+              Description=Run restic backup
+              After=network-online.target
+
+              [Service]
+              Type=oneshot
+              User={{ target_user }}
+              EnvironmentFile=-/etc/restic/env
+          ExecStart=/usr/bin/restic backup /home/{{ target_user }}
+          owner: root
+          group: root
+          mode: '0644'
+
+    - name: Optionally initialize restic repository (remote or local)
+      become: true
+      become_user: "{{ target_user }}"
+      shell: |
+        set -e
+        if [ -f /etc/restic/env ]; then
+          set -a; . /etc/restic/env; set +a
+        fi
+        export RESTIC_PASSWORD="{{ restic_password }}"
+        # check if repo is accessible
+        restic snapshots -r "{{ restic_repository }}" >/dev/null 2>&1 || restic init -r "{{ restic_repository }}"
+      when: restic_init_repo | bool and restic_repository is defined and restic_repository != ''
+
+    - name: Deploy restic timer
+      copy:
+        dest: "{{ restic_timer }}"
+        content: |
+          [Unit]
+          Description=Run restic backup daily
+
+          [Timer]
+          OnCalendar=daily
+          Persistent=true
+
+          [Install]
+          WantedBy=timers.target
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Reload systemd and enable restic timer
+      systemd:
+        daemon_reload: yes
+        name: restic-backup.timer
+        enabled: yes
+        state: started
+
+    - name: Optionally install Docker and Compose
+      when: install_docker | bool
+      block:
+        - name: Enable Debian backports (if running Debian/Ubuntu)
+          apt_repository:
+            repo: 'deb http://deb.debian.org/debian buster-backports main'
+            state: present
+          when: ansible_distribution == 'Debian'
+        - name: Install prerequisites for Docker
+          apt:
+            name: [apt-transport-https, ca-certificates, curl, gnupg-agent, software-properties-common]
+            state: present
+
+        - name: Add Docker GPG key
+          apt_key:
+            url: https://download.docker.com/linux/ubuntu/gpg
+            state: present
+
+        - name: Add Docker apt repository
+          apt_repository:
+            repo: deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_lsb.codename }} stable
+            state: present
+
+        - name: Update apt cache after adding docker repo
+          apt:
+            update_cache: yes
+
+        - name: Install Docker packages
+          apt:
+            name: [docker-ce, docker-ce-cli, containerd.io, docker-compose-plugin]
+            state: present
+
+        - name: Add user to docker group
+          user:
+            name: "{{ target_user }}"
+            groups: docker
+            append: yes
+
+    - name: Deploy SSH public key if provided via variable ssh_pub_key
+      when: ssh_pub_key is defined and ssh_pub_key != ''
+      block:
+        - name: Ensure .ssh directory exists
+          file:
+            path: "/home/{{ target_user }}/.ssh"
+            state: directory
+            owner: "{{ target_user }}"
+            group: "{{ target_user }}"
+            mode: '0700'
+
+        - name: Add authorized key
+          authorized_key:
+            user: "{{ target_user }}"
+            key: "{{ ssh_pub_key }}"
+            state: present
+
+    - name: Ensure ssh service is enabled and started
+      service:
+        name: ssh
+        state: started
+        enabled: yes
+
+    - name: Ensure rclone config is available for root (copy from user if present)
+      copy:
+        src: "/home/{{ target_user }}/.config/rclone/rclone.conf"
+        dest: "/root/.config/rclone/rclone.conf"
+        owner: root
+        group: root
+        mode: '0600'
+      when: lookup('file', '/home/' + target_user + '/.config/rclone/rclone.conf', errors='ignore') is not none
+
+    - name: Optionally create rclone config non-interactively
+      block:
+        - name: Ensure root rclone config dir
+          file:
+            path: /root/.config/rclone
+            state: directory
+            owner: root
+            group: root
+            mode: '0700'
+
+        - name: Write rclone config for S3-like provider
+          copy:
+            dest: /root/.config/rclone/rclone.conf
+            content: |
+              [{{ rclone_remote_name }}]
+              type = {{ rclone_provider }}
+              provider = AWS
+              access_key_id = {{ rclone_access_key }}
+              secret_access_key = {{ rclone_secret_key }}
+              region = {{ rclone_region }}
+              env_auth = false
+              endpoint = {{ rclone_endpoint }}
+            owner: root
+            group: root
+            mode: '0600'
+      when: rclone_config_auto | bool
+
+    - name: Deploy restic sync service to push repository via rclone
+      copy:
+        dest: /etc/systemd/system/restic-sync.service
+        content: |
+          [Unit]
+          Description=Sync restic repository to rclone remote
+          After=network-online.target
+
+          [Service]
+          Type=oneshot
+          ExecStart=/usr/bin/rclone sync /home/{{ target_user }}/.cache/restic-repo {{ rclone_remote }} --transfers 4 --checksum
+          User=root
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Deploy restic sync timer
+      copy:
+        dest: /etc/systemd/system/restic-sync.timer
+        content: |
+          [Unit]
+          Description=Run restic-sync daily
+
+          [Timer]
+          OnCalendar=daily
+          Persistent=true
+
+          [Install]
+          WantedBy=timers.target
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Enable and start restic-sync.timer
+      systemd:
+        name: restic-sync.timer
+        enabled: yes
+        state: started
+
+    - name: ReaR installation and timers (optional)
+      block:
+        - name: Install Relax-and-Recover (ReaR)
+          apt:
+            name: rear
+            state: present
+
+        - name: Deploy ReaR local.conf
+          copy:
+            dest: /etc/rear/local.conf
+            content: |
+              # Minimal ReaR configuration - builds an ISO and stores it under /var/lib/rear/output
+              OUTPUT=ISO
+              ISO_DIR=/var/lib/rear/output
+              # Do not auto-attach devices
+              AUTO_ATTACH=NO
+            owner: root
+            group: root
+            mode: '0644'
+
+        - name: Ensure ReaR output directory exists
+          file:
+            path: /var/lib/rear/output
+            state: directory
+            owner: root
+            group: root
+            mode: '0755'
+
+        - name: Deploy rear-backup.service
+          copy:
+            dest: /etc/systemd/system/rear-backup.service
+            content: |
+              [Unit]
+              Description=Run ReaR backup
+              After=network-online.target
+
+              [Service]
+              Type=oneshot
+              ExecStart=/usr/sbin/rear -v mkbackup
+              User=root
+            owner: root
+            group: root
+            mode: '0644'
+
+        - name: Deploy rear-backup.timer
+          copy:
+            dest: /etc/systemd/system/rear-backup.timer
+            content: |
+              [Unit]
+              Description=Run ReaR backup daily
+
+              [Timer]
+              OnCalendar=daily
+              Persistent=true
+
+              [Install]
+              WantedBy=timers.target
+            owner: root
+            group: root
+            mode: '0644'
+
+        - name: Deploy rear-upload.service to push ReaR outputs via rclone
+          copy:
+            dest: /etc/systemd/system/rear-upload.service
+            content: |
+              [Unit]
+              Description=Upload ReaR outputs to rclone remote
+              After=network-online.target
+
+              [Service]
+              Type=oneshot
+              ExecStart=/usr/bin/rclone sync /var/lib/rear/output {{ rclone_remote }}/rear --transfers 4 --checksum
+              User=root
+            owner: root
+            group: root
+            mode: '0644'
+
+        - name: Deploy rear-upload.timer
+          copy:
+            dest: /etc/systemd/system/rear-upload.timer
+            content: |
+              [Unit]
+              Description=Upload ReaR outputs daily
+
+              [Timer]
+              OnCalendar=daily
+              Persistent=true
+
+              [Install]
+              WantedBy=timers.target
+            owner: root
+            group: root
+            mode: '0644'
+
+        - name: Enable and start ReaR timers and upload timer
+          systemd:
+            daemon_reload: yes
+            name: "{{ item }}"
+            enabled: yes
+            state: started
+          loop:
+            - rear-backup.timer
+            - rear-upload.timer
+
+        - name: Deploy combined ReaR -> restic service (optional, requires restic env)
+          copy:
+            dest: /etc/systemd/system/rear-and-restic.service
+            content: |
+              [Unit]
+              Description=Run ReaR then restic backup of ReaR output
+              After=network-online.target
+              Wants=network-online.target
+
+              [Service]
+              Type=oneshot
+              User=root
+              EnvironmentFile=-/etc/restic/env
+              ExecStart=/usr/sbin/rear -v mkbackup
+              ExecStartPost=/usr/bin/restic backup /var/lib/rear/output --tag rear-backup
+
+              [Install]
+              WantedBy=multi-user.target
+          owner: root
+          group: root
+          mode: '0644'
+
+        - name: Deploy timer for rear-and-restic service
+          copy:
+            dest: /etc/systemd/system/rear-and-restic.timer
+            content: |
+              [Unit]
+              Description=Run ReaR and restic daily
+
+              [Timer]
+              OnCalendar=daily
+              Persistent=true
+
+              [Install]
+              WantedBy=timers.target
+          owner: root
+          group: root
+          mode: '0644'
+
+        - name: Enable and start rear-and-restic timer if restic configured
+          systemd:
+            daemon_reload: yes
+            name: rear-and-restic.timer
+            enabled: yes
+            state: started
+          when: restic_repository != ''
+      when: install_rear | bool
+
+    - name: Refresh user's shell to pick up groups (message)
+      debug:
+        msg: "User {{ target_user }} may need to log out and back in for group changes to take effect."
