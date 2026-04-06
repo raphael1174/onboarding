@@ -1,1 +1,3 @@
 
+restic_repository: 's3:s3.amazonaws.com/example-bucket'
+restic_password: 'change-me'
